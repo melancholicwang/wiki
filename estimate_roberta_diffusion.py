@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
-估算类RoBERTa的Diffusion Language Model所需的计算资源
+估算MDLM (Masked Diffusion Language Model)所需的计算资源
 
-参考nanoGPT和nanochat中的估算方法，计算训练和推理的：
+基于论文 "Simple and Effective Masked Diffusion Language Models" (NeurIPS 2024)
+参考：https://github.com/kuleshov-group/mdlm
+
+核心思想：将RoBERTa的MLM（Masked Language Modeling）视为一种离散扩散过程
+- 训练：加权的MLM损失，覆盖不同的masking rates
+- 推理：迭代demasking过程，逐步恢复完整序列
+
+计算内容：
 - FLOPs (浮点运算次数)
 - 参数量
 - 内存需求
@@ -16,60 +23,73 @@ from typing import Dict, Tuple
 
 @dataclass
 class ModelConfig:
-    """模型配置"""
+    """MDLM模型配置
+
+    MDLM使用标准的encoder-only架构（类似BERT/RoBERTa），
+    不需要复杂的时间嵌入网络
+    """
     name: str
     vocab_size: int = 50265  # RoBERTa vocab size
-    max_seq_len: int = 512
+    max_seq_len: int = 1024  # MDLM通常支持更长序列
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     mlp_ratio: float = 4.0
 
-    # Diffusion特有参数
-    diffusion_steps: int = 1000  # 扩散步数
-    time_embd_dim: int = 768  # 时间嵌入维度
+    # MDLM采样参数
+    sampling_steps: int = 1000  # 采样/去噪步数（可调：1000-10000）
 
     def __post_init__(self):
         self.d_head = self.n_embd // self.n_head
         self.d_mlp = int(self.n_embd * self.mlp_ratio)
 
 
-# 预定义的模型配置
-ROBERTA_CONFIGS = {
-    "roberta-base": ModelConfig(
-        name="roberta-base",
+# 预定义的MDLM模型配置
+# 基于MDLM论文的标准配置
+MDLM_CONFIGS = {
+    "mdlm-small": ModelConfig(
+        name="mdlm-small",
         n_layer=12,
         n_head=12,
         n_embd=768,
+        max_seq_len=1024,
     ),
-    "roberta-large": ModelConfig(
-        name="roberta-large",
+    "mdlm-base": ModelConfig(
+        name="mdlm-base",
+        n_layer=12,
+        n_head=12,
+        n_embd=768,
+        max_seq_len=1024,
+    ),
+    "mdlm-large": ModelConfig(
+        name="mdlm-large",
         n_layer=24,
         n_head=16,
         n_embd=1024,
+        max_seq_len=1024,
     ),
-    "roberta-xlarge": ModelConfig(
-        name="roberta-xlarge",
+    "mdlm-xlarge": ModelConfig(
+        name="mdlm-xlarge",
         n_layer=36,
         n_head=20,
         n_embd=1280,
+        max_seq_len=1024,
     ),
 }
 
 
 def estimate_parameters(config: ModelConfig) -> Dict[str, int]:
     """
-    估算模型参数量
+    估算MDLM模型参数量
 
-    RoBERTa架构包括：
+    MDLM使用标准的encoder-only架构（类似BERT/RoBERTa）：
     - Token embedding
     - Position embedding
-    - Transformer layers (attention + MLP)
-    - Output layer
+    - Transformer encoder layers (self-attention + MLP)
+    - Output projection head
 
-    Diffusion额外增加：
-    - Time embedding network
-    - 可能的条件嵌入
+    注意：MDLM不需要复杂的时间嵌入网络，
+    时间步信息可以通过简单的位置编码或额外的token来编码
     """
     params = {}
 
@@ -79,10 +99,6 @@ def estimate_parameters(config: ModelConfig) -> Dict[str, int]:
     # Position embedding: max_seq_len × n_embd
     params['pos_embd'] = config.max_seq_len * config.n_embd
 
-    # Time embedding for diffusion (MLP): diffusion_steps → time_embd_dim → n_embd
-    params['time_embd'] = (config.diffusion_steps * config.time_embd_dim +
-                           config.time_embd_dim * config.n_embd)
-
     # 每个Transformer层的参数
     # Self-attention: Q, K, V, O 投影矩阵
     params['attn_qkv_proj_per_layer'] = 3 * config.n_embd * config.n_embd  # Q, K, V
@@ -91,9 +107,11 @@ def estimate_parameters(config: ModelConfig) -> Dict[str, int]:
     # Layer norm (2 per layer): 2 × (scale + bias)
     params['ln_per_layer'] = 2 * 2 * config.n_embd
 
-    # MLP: two linear layers
-    params['mlp_per_layer'] = (config.n_embd * config.d_mlp +  # up projection
-                               config.d_mlp * config.n_embd)    # down projection
+    # MLP: two linear layers (with GELU activation)
+    params['mlp_per_layer'] = (config.n_embd * config.d_mlp +  # up projection + bias
+                               config.d_mlp +                   # bias
+                               config.d_mlp * config.n_embd +   # down projection
+                               config.n_embd)                   # bias
 
     # 所有层的总参数
     params_per_layer = (params['attn_qkv_proj_per_layer'] +
@@ -106,8 +124,9 @@ def estimate_parameters(config: ModelConfig) -> Dict[str, int]:
     # 最终的LayerNorm
     params['final_ln'] = 2 * config.n_embd
 
-    # Output projection (通常与token embedding共享权重，但diffusion可能需要独立的输出层)
-    params['output_proj'] = config.n_embd * config.vocab_size
+    # Output projection head: n_embd → vocab_size
+    # (可以与token embedding共享权重，这里按独立计算)
+    params['output_head'] = config.n_embd * config.vocab_size + config.vocab_size
 
     # 总参数量
     params['total'] = sum(params.values())
@@ -123,12 +142,13 @@ def estimate_flops_per_token(config: ModelConfig,
     参考nanoGPT的计算方法：
     - 前向传播: ~6N FLOPs per token (N是参数量)
     - 反向传播: ~2倍前向传播
-    - Diffusion额外的去噪步骤
+
+    对于MDLM：训练时的计算量与标准BERT/RoBERTa MLM训练基本相同
     """
     params = estimate_parameters(config)
     N = params['total']
 
-    # 基础的Transformer前向传播: 6N per token
+    # Encoder-only Transformer的前向传播: ~6N per token
     # 包括：2N (matmul) + 4N (attention)
     forward_flops_per_token = 6 * N
 
@@ -142,24 +162,35 @@ def estimate_flops_per_token(config: ModelConfig,
     return flops_per_token
 
 
-def estimate_diffusion_flops(config: ModelConfig,
-                             batch_size: int,
-                             seq_len: int,
-                             num_samples: int,
-                             is_training: bool = True) -> Dict[str, float]:
+def estimate_mdlm_sampling_flops(config: ModelConfig,
+                                 batch_size: int,
+                                 seq_len: int,
+                                 num_samples: int,
+                                 sampling_steps: int = None) -> Dict[str, float]:
     """
-    估算Diffusion模型的总FLOPs
+    估算MDLM采样/生成的总FLOPs
 
-    Diffusion模型需要多次前向传播（对应不同的时间步）
+    关键洞察：MDLM的迭代demasking过程中，
+    - 每步只需要预测masked positions的tokens
+    - 随着采样进行，masked tokens数量递减
+    - 但仍需要对整个序列做前向传播（因为是encoder架构）
+
+    采样过程：
+    1. 开始时所有tokens都是[MASK]
+    2. 每步unmask一部分tokens
+    3. T步后完成生成
+
+    参数：
+        sampling_steps: 采样步数，默认使用config中的值
     """
-    flops_per_token = estimate_flops_per_token(config, is_training)
+    if sampling_steps is None:
+        sampling_steps = config.sampling_steps
 
-    # 训练时：每个样本需要采样一个时间步进行去噪
-    # 推理时：需要所有diffusion_steps步的去噪
-    if is_training:
-        num_forward_passes = 1  # 训练时每个样本只采样一个时间步
-    else:
-        num_forward_passes = config.diffusion_steps  # 推理时需要完整的去噪过程
+    flops_per_token = estimate_flops_per_token(config, is_training=False)
+
+    # 推理时：需要多步迭代demasking
+    # 每步都要对整个序列做前向传播
+    num_forward_passes = sampling_steps
 
     total_tokens = batch_size * seq_len * num_samples
     total_flops = flops_per_token * total_tokens * num_forward_passes
@@ -169,8 +200,9 @@ def estimate_diffusion_flops(config: ModelConfig,
         'total_tflops': total_flops / 1e12,
         'total_pflops': total_flops / 1e15,
         'flops_per_token': flops_per_token,
-        'forward_passes': num_forward_passes,
+        'sampling_steps': sampling_steps,
         'total_tokens': total_tokens,
+        'tokens_per_step': total_tokens,
     }
 
 
@@ -222,7 +254,11 @@ def estimate_training_time(config: ModelConfig,
                           hardware_tflops: float,
                           mfu: float = 0.5) -> Dict[str, float]:
     """
-    估算训练时间
+    估算MDLM训练时间
+
+    MDLM训练使用加权的MLM损失，计算量与标准BERT/RoBERTa MLM训练相似
+    - 不需要多步扩散
+    - 每个训练样本只需要一次前向+反向传播
 
     Args:
         dataset_tokens: 训练数据集的总token数
@@ -233,10 +269,9 @@ def estimate_training_time(config: ModelConfig,
     tokens_per_batch = batch_size * seq_len
     total_steps = dataset_tokens // tokens_per_batch
 
-    # 每步的FLOPs
-    flops_per_step = estimate_diffusion_flops(
-        config, batch_size, seq_len, num_samples=1, is_training=True
-    )['total_flops']
+    # 每步的FLOPs（MDLM训练时每个样本只需一次前向+反向）
+    flops_per_token = estimate_flops_per_token(config, is_training=True)
+    flops_per_step = flops_per_token * tokens_per_batch
 
     # 总FLOPs
     total_flops = flops_per_step * total_steps
@@ -263,13 +298,17 @@ def estimate_training_time(config: ModelConfig,
 def print_estimation(model_name: str,
                     dataset_tokens: int = 100e9,  # 100B tokens
                     batch_size: int = 256,
-                    seq_len: int = 512,
+                    seq_len: int = 1024,
                     num_gpus: int = 8,
-                    gpu_name: str = "A100-80GB"):
+                    gpu_name: str = "A100-80GB",
+                    sampling_steps: int = 1000):
     """
-    打印完整的估算报告
+    打印MDLM的完整计算资源估算报告
     """
-    config = ROBERTA_CONFIGS[model_name]
+    config = MDLM_CONFIGS[model_name]
+    # 覆盖采样步数（如果提供）
+    if sampling_steps != config.sampling_steps:
+        config.sampling_steps = sampling_steps
 
     # GPU性能数据（TFLOP/s for BF16/FP16）
     gpu_specs = {
@@ -284,18 +323,20 @@ def print_estimation(model_name: str,
     gpu_memory = gpu_specs[gpu_name]["memory_gb"]
 
     print("=" * 80)
-    print(f"计算资源估算: {config.name} + Diffusion Language Model")
+    print(f"MDLM计算资源估算: {config.name}")
+    print("(Masked Diffusion Language Model - MLM as Discrete Diffusion)")
     print("=" * 80)
 
     # 模型参数
     params = estimate_parameters(config)
-    print(f"\n【模型参数】")
+    print(f"\n【模型架构 & 参数】")
+    print(f"  架构: Encoder-only Transformer (类似BERT/RoBERTa)")
     print(f"  总参数量: {params['total'] / 1e6:.1f}M ({params['total'] / 1e9:.2f}B)")
     print(f"  - Token Embedding: {params['token_embd'] / 1e6:.1f}M")
     print(f"  - Position Embedding: {params['pos_embd'] / 1e6:.1f}M")
-    print(f"  - Time Embedding (Diffusion): {params['time_embd'] / 1e6:.1f}M")
     print(f"  - Transformer Layers ({config.n_layer} layers): {params['all_layers'] / 1e6:.1f}M")
-    print(f"  - Output Projection: {params['output_proj'] / 1e6:.1f}M")
+    print(f"  - Output Head: {params['output_head'] / 1e6:.1f}M")
+    print(f"  注：无需复杂的时间嵌入网络（与连续扩散模型不同）")
 
     # 内存需求
     print(f"\n【内存需求】")
@@ -323,12 +364,17 @@ def print_estimation(model_name: str,
     print(f"  训练: {flops_per_token / 1e9:.2f} GFLOPs/token")
     print(f"  参数量N: {params['total'] / 1e6:.1f}M")
     print(f"  FLOPs ≈ 6N (前向) + 12N (反向) = {flops_per_token / params['total']:.1f}N")
+    print(f"  (与标准BERT/RoBERTa MLM训练相同)")
 
-    # Diffusion特有的计算
-    print(f"\n【Diffusion特性】")
-    print(f"  扩散步数: {config.diffusion_steps}")
-    print(f"  训练时每样本前向次数: 1 (采样单个时间步)")
-    print(f"  推理时每样本前向次数: {config.diffusion_steps} (完整去噪)")
+    # MDLM特有的特性
+    print(f"\n【MDLM方法特性】")
+    print(f"  训练方法: 加权MLM损失 (覆盖不同masking rates)")
+    print(f"  - 每个样本只需1次前向+反向传播")
+    print(f"  - 训练效率与标准RoBERTa相同")
+    print(f"  推理方法: 迭代demasking")
+    print(f"  - 采样步数: {config.sampling_steps} (可调：1000-10000)")
+    print(f"  - 每步对整个序列做前向传播")
+    print(f"  - 逐步unmask tokens直到生成完整序列")
 
     # 训练时间估算
     print(f"\n【训练时间估算】")
@@ -350,45 +396,53 @@ def print_estimation(model_name: str,
         print(f"    实际算力: {timing['actual_tflops']:.1f} TFLOP/s")
         print(f"    训练时间: {timing['training_time_days']:.1f} 天 ({timing['training_time_hours']:.0f} 小时)")
 
-    # 推理性能
-    print(f"\n【推理性能估算】")
-    inference_flops = estimate_diffusion_flops(
-        config, batch_size=1, seq_len=seq_len,
-        num_samples=1, is_training=False
-    )
-    print(f"  生成一个序列 (seq_len={seq_len}):")
-    print(f"    需要 {config.diffusion_steps} 次去噪步骤")
-    print(f"    总FLOPs: {inference_flops['total_tflops']:.2f} TFLOPs")
+    # 推理/采样性能
+    print(f"\n【采样/生成性能估算】")
 
-    # 在单GPU上的推理时间
-    single_gpu_time = inference_flops['total_flops'] / (gpu_tflops * 1e12)
-    print(f"    在单个{gpu_name}上: {single_gpu_time:.2f} 秒")
-    print(f"    生成速度: {seq_len / single_gpu_time:.1f} tokens/秒")
+    # 测试不同采样步数
+    for steps in [1000, 5000, 10000]:
+        sampling_flops = estimate_mdlm_sampling_flops(
+            config, batch_size=1, seq_len=seq_len,
+            num_samples=1, sampling_steps=steps
+        )
+        single_gpu_time = sampling_flops['total_flops'] / (gpu_tflops * 1e12)
+        tokens_per_sec = seq_len / single_gpu_time
+
+        print(f"\n  采样步数 T={steps}:")
+        print(f"    生成一个序列 (seq_len={seq_len})")
+        print(f"    总FLOPs: {sampling_flops['total_tflops']:.2f} TFLOPs")
+        print(f"    在单个{gpu_name}上: {single_gpu_time:.2f} 秒")
+        print(f"    生成速度: {tokens_per_sec:.1f} tokens/秒")
+
+    print(f"\n  注意：")
+    print(f"    - 采样步数越多，生成质量越好，但速度越慢")
+    print(f"    - 可使用更少步数（如1000步）加速生成")
+    print(f"    - MDLM比连续扩散模型更高效（离散masking）")
 
     print("\n" + "=" * 80)
 
 
 def compare_models():
     """
-    比较不同规模的模型
+    比较不同规模的MDLM模型
     """
     print("\n\n")
     print("=" * 80)
-    print("模型规模对比")
+    print("MDLM模型规模对比")
     print("=" * 80)
 
     print(f"\n{'Model':<20} {'Parameters':<15} {'Training Memory':<20} {'Training Time (days)':<25}")
     print("-" * 80)
 
-    for model_name in ["roberta-base", "roberta-large", "roberta-xlarge"]:
-        config = ROBERTA_CONFIGS[model_name]
+    for model_name in ["mdlm-base", "mdlm-large", "mdlm-xlarge"]:
+        config = MDLM_CONFIGS[model_name]
         params = estimate_parameters(config)
-        mem = estimate_memory(config, batch_size=256, seq_len=512)
+        mem = estimate_memory(config, batch_size=256, seq_len=1024)
         timing = estimate_training_time(
             config,
             dataset_tokens=100e9,
             batch_size=256,
-            seq_len=512,
+            seq_len=1024,
             hardware_tflops=312 * 8,  # 8x A100
             mfu=0.5
         )
@@ -401,26 +455,34 @@ def compare_models():
 
 
 if __name__ == "__main__":
-    # 估算RoBERTa-base + Diffusion
+    print("=" * 80)
+    print("MDLM (Masked Diffusion Language Model) 计算资源估算工具")
+    print("基于论文: Simple and Effective Masked Diffusion Language Models (NeurIPS 2024)")
+    print("=" * 80)
+    print()
+
+    # 估算MDLM-base
     print_estimation(
-        model_name="roberta-base",
-        dataset_tokens=100e9,  # 100B tokens
+        model_name="mdlm-base",
+        dataset_tokens=100e9,  # 100B tokens (类似MDLM论文在OpenWebText上训练)
         batch_size=256,
-        seq_len=512,
+        seq_len=1024,
         num_gpus=8,
-        gpu_name="A100-80GB"
+        gpu_name="A100-80GB",
+        sampling_steps=1000
     )
 
     print("\n\n")
 
-    # 估算RoBERTa-large + Diffusion
+    # 估算MDLM-large
     print_estimation(
-        model_name="roberta-large",
+        model_name="mdlm-large",
         dataset_tokens=100e9,
         batch_size=128,
-        seq_len=512,
+        seq_len=1024,
         num_gpus=16,
-        gpu_name="A100-80GB"
+        gpu_name="A100-80GB",
+        sampling_steps=1000
     )
 
     # 模型对比
@@ -428,19 +490,36 @@ if __name__ == "__main__":
 
     print("\n")
     print("=" * 80)
-    print("注意事项:")
+    print("关键要点和注意事项:")
     print("=" * 80)
     print("""
-1. 这些估算基于理论计算，实际值可能因实现细节而异
-2. MFU (Model FLOPs Utilization) 通常在30%-60%之间，取决于:
-   - 模型大小
-   - Batch size
-   - 序列长度
-   - 硬件和软件优化
-3. Diffusion模型的推理比标准LM慢很多（需要多步去噪）
-4. 可以通过以下方法加速:
-   - DDIM采样（减少采样步数）
-   - 知识蒸馏
-   - 并行去噪
-5. 内存估算包含了训练时的完整开销，实际使用可能需要额外的buffer
+【MDLM vs 连续扩散模型】
+1. MDLM将MLM视为离散扩散过程，架构更简单（无需复杂时间嵌入）
+2. 训练效率与标准BERT/RoBERTa相同（每样本只需1次前向+反向）
+3. 推理需要多步迭代demasking，但比连续扩散更高效
+
+【训练】
+4. MFU (Model FLOPs Utilization) 通常在30%-60%之间，取决于:
+   - 模型大小、Batch size、序列长度
+   - 硬件和软件优化水平
+5. 训练数据量：MDLM论文使用OpenWebText (~10B tokens)训练1M步
+
+【推理/采样】
+6. 采样步数可调（1000-10000步）：
+   - 更多步数 → 更高质量，但更慢
+   - MDLM论文使用1000步可达到接近AR模型的困惑度（差距15-25%）
+7. 加速方法：
+   - 减少采样步数（从10000降到1000）
+   - 使用缓存优化（ddpm_cache采样器比SEDD快3-4倍）
+   - Semi-autoregressive生成
+
+【实现参考】
+8. GitHub: https://github.com/kuleshov-group/mdlm
+9. 论文: https://arxiv.org/abs/2406.07524
+10. ByteDance的Seed Diffusion基于MDLM实现
+
+【估算准确性】
+11. 这些估算基于理论计算，实际值可能因实现细节而异
+12. 内存估算包含训练时的完整开销，实际可能需要额外buffer
+13. FLOPs基于标准Transformer的6N规则（N为参数量）
 """)
